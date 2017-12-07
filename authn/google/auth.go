@@ -1,6 +1,7 @@
 package google
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -14,10 +15,18 @@ import (
 	plus "google.golang.org/api/plus/v1"
 )
 
-// Authorizer stores authorization metadata
+// Authorizer authorizes a google user against a whitelist of domains
 type Authorizer struct {
 	authorizedDomains map[string]bool
 	tokenMap          sync.Map
+}
+
+func (a *Authorizer) domains() []string {
+	response := []string{}
+	for k := range a.authorizedDomains {
+		response = append(response, k)
+	}
+	return response
 }
 
 func (a *Authorizer) containsDomain(domain string) bool {
@@ -47,7 +56,7 @@ func New(opts ...func(*Authorizer)) *Authorizer {
 	return a
 }
 
-func getPerson(authorizationValue string) (*plus.Person, error) {
+func getPerson(ctx context.Context, authorizationValue string) (*plus.Person, error) {
 	googleURL := "https://www.googleapis.com/plus/v1/people/me"
 	req, err := http.NewRequest(http.MethodGet, googleURL, nil)
 	if err != nil {
@@ -57,7 +66,7 @@ func getPerson(authorizationValue string) (*plus.Person, error) {
 	req.Header.Add("Authorization", authorizationValue)
 
 	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
 		zap.L().Error("Error making request", zap.Error(err))
 		return nil, err
@@ -101,14 +110,7 @@ func (a *Authorizer) extractEmail(person *plus.Person) string {
 	return ""
 }
 
-func (a *Authorizer) validatePerson(person *plus.Person) bool {
-	if a.containsDomain(person.Domain) {
-		return true
-	}
-	return false
-}
-
-func (a *Authorizer) authorize(token string) bool {
+func (a *Authorizer) authorize(ctx context.Context, token string) bool {
 	if token == "" {
 		zap.L().Debug("Empty token")
 		return false
@@ -122,16 +124,16 @@ func (a *Authorizer) authorize(token string) bool {
 	if !ok {
 
 		// Get the person's info
-		person, err := getPerson(token)
+		person, err := getPerson(ctx, token)
 		if err != nil {
 			zap.L().Info("Couldn't get person", zap.String("token", token))
 			return false
 		}
 
 		// Validate the person's domain
-		validated := a.validatePerson(person)
+		validated := a.containsDomain(person.Domain)
 		if !validated {
-			zap.L().Info("Invalid person", zap.String("person", fmt.Sprintf("%#v", person)))
+			zap.L().Info("Invalid domain", zap.String("person", fmt.Sprintf("%#v", person)), zap.Strings("domains", a.domains()))
 			return false
 		}
 
@@ -171,11 +173,11 @@ func (a *Authorizer) LoggingClosure(r *http.Request) []zapcore.Field {
 	return []zapcore.Field{zap.String("user", username)}
 }
 
-// Authorized is a middleware for adding AuthZ to routes
+// Authorize is a middleware for adding AuthZ to routes
 func (a *Authorizer) Authorize() middlewares.Middleware {
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ok := a.authorize(r.Header.Get("Authorization"))
+			ok := a.authorize(r.Context(), r.Header.Get("Authorization"))
 			if !ok {
 				http.Error(w, "Not authorized", http.StatusUnauthorized)
 				return
